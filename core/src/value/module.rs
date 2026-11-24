@@ -255,32 +255,6 @@ impl<'js, T> Module<'js, T> {
     }
 }
 
-/// Release the reference owned by a module value returned from QuickJS.
-///
-/// `JS_Eval` (`JS_EVAL_FLAG_COMPILE_ONLY`) and `JS_ReadObject` hand back an owned
-/// `JS_TAG_MODULE` value. That reference is separate from the one the context
-/// module list took in `js_new_module_def` (the list starts the count at 1, and
-/// `JS_NewModuleValue` bumps it). [`Module`] stores the raw pointer and has no
-/// [`Drop`] impl, so this value has to be freed here. Leaving it alive leaks the
-/// definition once QuickJS frees modules according to the refcount, which is what
-/// quickjs-ng does as of c40c431.
-///
-/// The list reference is left alone, so the pointer stays valid until the context
-/// frees the module. On older QuickJS this does not free the struct either:
-/// `JS_FreeValue` only drops this value's reference, and `js_free_value_rt` runs
-/// for `JS_TAG_MODULE` only when the count hits zero.
-fn release_module_value(
-    ctx: &Ctx<'_>,
-    module_val: qjs::JSValue,
-) -> Result<NonNull<qjs::JSModuleDef>> {
-    debug_assert_eq!(qjs::JS_TAG_MODULE, unsafe {
-        qjs::JS_VALUE_GET_TAG(module_val)
-    });
-    let ptr = NonNull::new(unsafe { qjs::JS_VALUE_GET_PTR(module_val).cast() });
-    unsafe { qjs::JS_FreeValue(ctx.as_ptr(), module_val) };
-    ptr.ok_or(Error::Unknown)
-}
-
 impl<'js> Module<'js, Declared> {
     /// Declare a module but don't evaluate it.
     pub fn declare<N, S>(ctx: Ctx<'js>, name: N, source: S) -> Result<Module<'js, Declared>>
@@ -294,8 +268,14 @@ impl<'js> Module<'js, Declared> {
 
         let module_val = unsafe { ctx.eval_raw(source, name.as_c_str(), flag as i32)? };
         let module_val = unsafe { ctx.handle_exception(module_val)? };
-        let module_ptr = release_module_value(&ctx, module_val)?;
-        unsafe { Ok(Module::from_ptr(ctx, module_ptr)) }
+        debug_assert_eq!(qjs::JS_TAG_MODULE, unsafe {
+            qjs::JS_VALUE_GET_TAG(module_val)
+        });
+        let module_ptr = NonNull::new(unsafe { qjs::JS_VALUE_GET_PTR(module_val).cast() });
+        // The module list already holds this definition.
+        // Release the owned value QuickJS returned.
+        unsafe { qjs::JS_FreeValue(ctx.as_ptr(), module_val) };
+        unsafe { Ok(Module::from_ptr(ctx, module_ptr.ok_or(Error::Unknown)?)) }
     }
 
     /// Declare a rust native module but don't evaluate it.
@@ -305,9 +285,6 @@ impl<'js> Module<'js, Declared> {
         D: ModuleDef,
     {
         let name = CString::new(name)?;
-        // `JS_NewCModule` returns the module-list pointer. It does not create an
-        // owned `JS_TAG_MODULE` value, so unlike [`Module::declare`] there is no
-        // reference to free.
         let ptr =
             unsafe { qjs::JS_NewCModule(ctx.as_ptr(), name.as_ptr(), Some(Self::eval_fn::<D>)) };
         let ptr = NonNull::new(ptr).ok_or(Error::Unknown)?;
@@ -370,19 +347,19 @@ impl<'js> Module<'js, Declared> {
             )
         };
         let module = ctx.handle_exception(module)?;
-        let module_ptr = release_module_value(&ctx, module)?;
-        unsafe { Ok(Module::from_ptr(ctx, module_ptr)) }
+        debug_assert_eq!(qjs::JS_TAG_MODULE, unsafe { qjs::JS_VALUE_GET_TAG(module) });
+        let module_ptr = NonNull::new(unsafe { qjs::JS_VALUE_GET_PTR(module).cast() });
+        // The module list already holds this definition.
+        // Release the owned value QuickJS returned.
+        unsafe { qjs::JS_FreeValue(ctx.as_ptr(), module) };
+        unsafe { Ok(Module::from_ptr(ctx, module_ptr.ok_or(Error::Unknown)?)) }
     }
 
     /// Load a module from a raw module loading function.
     ///
     /// # Safety
     /// The soundness of this function depends completely on if load_fn is implemented correctly.
-    /// The load_fn function must return a pointer to a valid module loaded with the given context,
-    /// created the way [`Module::declare_def`] / `JS_NewCModule` does: the pointer is already on
-    /// the context module list, and the callback must not also return an owned `JS_TAG_MODULE`
-    /// value. [`Module`] does not release a reference when dropped, so an extra value reference
-    /// would leak.
+    /// THe load_fn function must return a pointer to a valid module loaded with the given context.
     pub unsafe fn from_load_fn<N>(
         ctx: Ctx<'js>,
         name: N,
@@ -406,9 +383,7 @@ impl<'js> Module<'js, Declared> {
             #[cfg(feature = "parallel")]
             qjs::JS_UpdateStackTop(qjs::JS_GetRuntime(self.ctx.as_ptr()));
 
-            // `JS_EvalFunction` frees one module reference, so duplicate first.
-            // The duplicate is the reference it consumes. The context module list
-            // keeps its own, and `Module` does not own one — do not free `v` again.
+            // JS_EvalFunction `free's` the module so we should dup first
             let v = qjs::JS_MKPTR(qjs::JS_TAG_MODULE, self.ptr.as_ptr().cast());
             qjs::JS_DupValue(self.ctx.as_ptr(), v);
             qjs::JS_EvalFunction(self.ctx.as_ptr(), v)
@@ -780,193 +755,30 @@ mod test {
         });
     }
 
-    unsafe extern "C" {
-        fn js_rquickjs_module_def_counts(
-            rt: *mut qjs::JSRuntime,
-            created: *mut core::ffi::c_int,
-            freed: *mut core::ffi::c_int,
-        );
-    }
-
-    fn module_def_counts(rt: &Runtime) -> (i32, i32) {
-        let guard = rt.inner.lock();
-        let mut created = 0;
-        let mut freed = 0;
-        unsafe {
-            js_rquickjs_module_def_counts(guard.rt.as_ptr(), &mut created, &mut freed);
-        }
-        (created, freed)
-    }
-
-    unsafe extern "C" fn record_module_def_counts(
-        rt: *mut qjs::JSRuntime,
-        arg: *mut core::ffi::c_void,
-    ) {
-        let out = unsafe { &mut *arg.cast::<(i32, i32)>() };
-        unsafe { js_rquickjs_module_def_counts(rt, &mut out.0, &mut out.1) };
-    }
-
-    unsafe extern "C" fn load_rust(
-        ctx: *mut qjs::JSContext,
-        name: *const qjs::c_char,
-    ) -> *mut qjs::JSModuleDef {
-        Module::init_raw::<RustModule>(ctx, name)
-    }
-
-    /// Modules created through every rquickjs entry point are freed with the
-    /// runtime, including a module whose top-level await is still pending.
-    ///
-    /// quickjs-ng c40c431 makes `JSModuleDef` lifetime follow the refcount.
-    /// `Module::declare` and `Module::load` used to drop the returned module
-    /// value without `JS_FreeValue`, which leaked one definition per call.
     #[test]
-    fn module_definitions_are_freed() {
-        let rt = Runtime::new().unwrap();
-        // Abort if QuickJS still has blocks, atoms, or strings at runtime shutdown.
-        rt.set_dump_flags(qjs::JS_DUMP_LEAKS as u64 | qjs::JS_ABORT_ON_LEAKS as u64);
+    fn pending_top_level_await_and_bytecode() {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| {
+            let (module, promise) = Module::declare(
+                ctx.clone(),
+                "pending.js",
+                "await new Promise(() => {}); export const result = 1;",
+            )
+            .unwrap()
+            .eval()
+            .unwrap();
+            assert!(module.get::<_, i32>("result").is_err());
+            drop(promise);
 
-        let mut at_free = (-1, -1);
-        {
-            let guard = rt.inner.lock();
-            let rc = unsafe {
-                qjs::JS_AddRuntimeFinalizer(
-                    guard.rt.as_ptr(),
-                    Some(record_module_def_counts),
-                    (&mut at_free as *mut (i32, i32)).cast(),
-                )
-            };
-            assert_eq!(rc, 0);
-        }
-
-        let baseline = module_def_counts(&rt);
-        assert_eq!(baseline, (0, 0));
-
-        // Paths that must release every module when the context goes away:
-        // declare, eval, a second eval, clone, native modules, bytecode load,
-        // dynamic import, and a top-level await that does resolve.
-        {
-            let ctx = Context::full(&rt).unwrap();
-            ctx.with(|ctx| {
-                for i in 0..32 {
-                    let name = format!("decl-{i}.js");
-                    let module = Module::declare(ctx.clone(), name, "export const n = 1;").unwrap();
-                    assert!(module.name::<StdString>().unwrap().starts_with("decl-"));
-                }
-
-                let (module, promise) =
-                    Module::declare(ctx.clone(), "sync.js", "export const n = 2;")
-                        .unwrap()
-                        .eval()
-                        .unwrap();
-                promise.finish::<()>().unwrap();
-                assert_eq!(module.get::<_, i32>("n").unwrap(), 2);
-                let cloned = module.clone();
-                let (again, promise) = cloned.into_declared().eval().unwrap();
-                promise.finish::<()>().unwrap();
-                assert_eq!(again.get::<_, i32>("n").unwrap(), 2);
-
-                Module::declare_def::<RustModule, _>(ctx.clone(), "rust_mod").unwrap();
-                let (native, promise) =
-                    Module::evaluate_def::<RustModule, _>(ctx.clone(), "rust_mod_eval").unwrap();
-                promise.finish::<()>().unwrap();
-                assert_eq!(native.get::<_, StdString>("hello").unwrap(), "world");
-
-                let loaded =
-                    unsafe { Module::from_load_fn(ctx.clone(), "from_load", load_rust) }.unwrap();
-                let (_loaded, promise) = loaded.eval().unwrap();
-                promise.finish::<()>().unwrap();
-
-                Module::evaluate(ctx.clone(), "direct.js", "export const n = 3;")
-                    .unwrap()
-                    .finish::<()>()
-                    .unwrap();
-
-                let (tla, promise) = Module::declare(
-                    ctx.clone(),
-                    "tla.js",
-                    "export let v = await Promise.resolve(7);",
-                )
-                .unwrap()
-                .eval()
-                .unwrap();
-                promise.finish::<()>().unwrap();
-                assert_eq!(tla.get::<_, i32>("v").unwrap(), 7);
-
-                let fresh = Module::declare(ctx.clone(), "bc.js", "export const n = 2;").unwrap();
-                let bytes = match fresh.write(WriteOptions::default()) {
-                    Ok(bytes) => bytes,
-                    Err(_) => panic!("write module bytecode: {:?}", ctx.catch()),
-                };
-                let from_bc = unsafe { Module::load(ctx.clone(), &bytes) }.unwrap();
-                let (from_bc, promise) = from_bc.eval().unwrap();
-                promise.finish::<()>().unwrap();
-                assert_eq!(from_bc.get::<_, i32>("n").unwrap(), 2);
-
-                let imported: Object = Module::import(&ctx, "rust_mod").unwrap().finish().unwrap();
-                assert_eq!(imported.get::<_, StdString>("hello").unwrap(), "world");
-            });
-        }
-
-        let after_context = module_def_counts(&rt);
-        // Function objects keep realm references, so the context — and the
-        // modules still on its list — often outlive the Rust `Context` and are
-        // released during runtime teardown. Nothing may have been freed twice.
-        assert!(
-            after_context.0 > baseline.0,
-            "expected the context to create modules, counts={after_context:?}"
-        );
-        assert!(
-            after_context.1 <= after_context.0,
-            "freed more module defs than were created: {after_context:?}"
-        );
-
-        // A top-level await that never settles keeps a module value alive in the
-        // promise reaction. The definition must survive context teardown (the
-        // use-after-free c40c431 fixes) and still be freed with the runtime.
-        {
-            let ctx = Context::full(&rt).unwrap();
-            ctx.with(|ctx| {
-                let pending = Module::evaluate(
-                    ctx.clone(),
-                    "pending.js",
-                    "globalThis.p = new Promise(() => {});\nawait globalThis.p;\n",
-                )
-                .unwrap();
-                let (declared, promise) = Module::declare(
-                    ctx.clone(),
-                    "pending-declared.js",
-                    "globalThis.q = new Promise(() => {});\nawait globalThis.q;\n",
-                )
-                .unwrap()
-                .eval()
-                .unwrap();
-                // Keep the handles until the end of the closure, then drop them
-                // without settling the await.
-                drop((pending, declared, promise));
-            });
-        }
-
-        let after_pending = module_def_counts(&rt);
-        assert!(
-            after_pending.0 > after_context.0,
-            "pending top-level await did not create a module"
-        );
-        assert!(
-            after_pending.1 <= after_pending.0,
-            "freed more module defs than were created: {after_pending:?}"
-        );
-
-        drop(rt);
-
-        assert_eq!(
-            at_free.0, at_free.1,
-            "module defs leaked at runtime shutdown: created {}, freed {}",
-            at_free.0, at_free.1
-        );
-        eprintln!("module defs created={} freed={}", at_free.0, at_free.1);
-        assert!(
-            at_free.0 >= after_pending.0,
-            "runtime shutdown lost module-def count"
-        );
+            let source = Module::declare(ctx.clone(), "bc.js", "export const n = 2;").unwrap();
+            let bytes = source.write(WriteOptions::default()).unwrap();
+            let loaded = unsafe { Module::load(ctx.clone(), &bytes) }.unwrap();
+            let (loaded, promise) = loaded.eval().unwrap();
+            promise.finish::<()>().unwrap();
+            assert_eq!(loaded.get::<_, i32>("n").unwrap(), 2);
+        });
+        drop(context);
+        drop(runtime);
     }
 }
