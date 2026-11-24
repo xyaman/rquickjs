@@ -224,6 +224,17 @@ fn main() {
     }
     fs::copy("quickjs.bind.h", out_dir.join("quickjs.bind.h")).expect("Unable to copy source");
 
+    // quickjs-ng c40c431 changes module lifetime. That commit is 50 commits
+    // past the vendored 0.17.0 pin and also changes public API (JS_LoadModule's
+    // arity, JSInterruptHandler, JSValueUnion), so the submodule stays put and
+    // the module-lifetime fix is applied to the copied sources.
+    println!("cargo:rerun-if-changed=quickjs/quickjs.c");
+    println!("cargo:rerun-if-changed=patches/module-refcount.hunks");
+    apply_exact_hunks(
+        &out_dir.join("quickjs.c"),
+        include_str!("patches/module-refcount.hunks"),
+    );
+
     if target_os == "wasi" && !matches!(env::var("RQUICKJS_SYS_NO_WASI_SDK").as_deref(), Ok("1")) {
         let wasi_sdk_path = get_wasi_sdk_path();
         if !wasi_sdk_path.try_exists().unwrap() {
@@ -288,6 +299,43 @@ fn main() {
     if !has_atomic64 && target_os == "linux" {
         println!("cargo:rustc-link-lib=atomic");
     }
+}
+
+/// Apply `<<<<<<<` / `=======` / `>>>>>>>` hunks from `hunks` to `path`.
+///
+/// Each old side must match the file exactly once. Used instead of the `patch`
+/// binary so Windows builds do not need an extra tool.
+fn apply_exact_hunks(path: &Path, hunks: &str) {
+    let mut src = fs::read_to_string(path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+    let mut rest = hunks;
+    let mut applied = 0usize;
+    while let Some(start) = rest.find("<<<<<<<\n") {
+        rest = &rest[start + "<<<<<<<\n".len()..];
+        let mid = rest
+            .find("\n=======\n")
+            .unwrap_or_else(|| panic!("patch hunk {applied} is missing ======="));
+        let old = &rest[..mid];
+        rest = &rest[mid + "\n=======\n".len()..];
+        let end = rest
+            .find("\n>>>>>>>\n")
+            .unwrap_or_else(|| panic!("patch hunk {applied} is missing >>>>>>>"));
+        let new = &rest[..end];
+        rest = &rest[end + "\n>>>>>>>\n".len()..];
+        let count = src.matches(old).count();
+        if count != 1 {
+            panic!(
+                "patch hunk {applied} in {} matched {count} times (expected 1):\n{old}",
+                path.display()
+            );
+        }
+        src = src.replacen(old, new, 1);
+        applied += 1;
+    }
+    if applied == 0 {
+        panic!("no patch hunks applied to {}", path.display());
+    }
+    fs::write(path, src).unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
 }
 
 fn feature_to_cargo(name: impl AsRef<str>) -> String {

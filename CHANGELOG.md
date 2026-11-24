@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed JavaScript modules leaking one reference each when a runtime shuts down. `Module::declare` and `Module::load` now release the module value QuickJS returns; the context module list keeps the definition alive. This matches quickjs-ng c40c431, where module lifetime follows the refcount instead of `js_free_module_def()` always freeing the struct
+- Applied the module-lifetime part of quickjs-ng c40c431 on top of the vendored 0.17.0 sources (pending top-level await no longer use-after-frees the module, and bytecode modules take one reference). The submodule pin is unchanged: that commit also changes `JS_LoadModule`, `JSInterruptHandler`, and `JSValueUnion`
 - Fixed nondeterministic module export and method accessor ordering in procedural macro output
 - Fixed building `rquickjs-sys` with plain clang on Windows MSVC targets (`CC=clang`): the C flags now follow the compiler rather than the target
 - Fixed `Ctx::eval` and other related methods returning a `String contained internal null bytes` error when JS source contains null bytes
